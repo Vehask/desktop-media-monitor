@@ -22,8 +22,7 @@ $monitoredApps = @(
     "Discord"
 )
 
-$monitorBrave      = $true
-$monitorFullscreen = $true
+$monitorBrave = $true
 
 # ============================================================================
 
@@ -45,38 +44,6 @@ function Invoke-Async($op, $type) {
 $smtcManager = Invoke-Async `
     ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync()) `
     ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager])
-
-if (-not ([System.Management.Automation.PSTypeName]'WindowHelper').Type) {
-    Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-using System.Text;
-
-public class WindowHelper {
-    [DllImport("user32.dll")]
-    public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")]
-    public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
-    [DllImport("user32.dll")]
-    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-    [DllImport("user32.dll")]
-    public static extern bool IsZoomed(IntPtr hWnd);
-    [DllImport("user32.dll")]
-    public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
-    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT {
-        public int Left;
-        public int Top;
-        public int Right;
-        public int Bottom;
-    }
-}
-"@
-}
 
 function Test-BravePlayingViaSMTC {
     if (-not $monitorBrave) { return @{ IsPlaying = $false; Details = "" } }
@@ -132,60 +99,6 @@ function Test-MonitoredAppsPlayingAudio {
     return @{ IsPlaying = $false; Details = "" }
 }
 
-function Get-AllWindowInfo {
-    $windows = New-Object System.Collections.ArrayList
-    $callback = {
-        param($hwnd, $lParam)
-        $title = New-Object System.Text.StringBuilder 256
-        [WindowHelper]::GetWindowText($hwnd, $title, $title.Capacity) | Out-Null
-        if ($title.Length -eq 0) { return $true }
-        $processId = 0
-        [WindowHelper]::GetWindowThreadProcessId($hwnd, [ref]$processId) | Out-Null
-        $rect = New-Object WindowHelper+RECT
-        [WindowHelper]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
-        try { $processName = (Get-Process -Id $processId -ErrorAction SilentlyContinue).ProcessName }
-        catch { $processName = "" }
-        $null = $windows.Add(@{
-            Title = $title.ToString(); ProcessName = $processName
-            ProcessId = $processId; Left = $rect.Left; Top = $rect.Top
-            Right = $rect.Right; Bottom = $rect.Bottom
-        })
-        return $true
-    }
-    [WindowHelper]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null
-    return $windows
-}
-
-function Test-IsFullscreenOrBorderless {
-    param($windowInfo)
-    Add-Type -AssemblyName System.Windows.Forms
-    foreach ($screen in [System.Windows.Forms.Screen]::AllScreens) {
-        $b = $screen.Bounds
-        if ($windowInfo.Left -le $b.Left -and $windowInfo.Top -le $b.Top -and
-            $windowInfo.Right -ge ($b.Left + $b.Width) -and $windowInfo.Bottom -ge ($b.Top + $b.Height)) {
-            return $true
-        }
-    }
-    return $false
-}
-
-function Test-AnyFullscreenWindow {
-    if (-not $monitorFullscreen) { return @{ IsFullscreen = $false; Details = "" } }
-
-    $excludeProcesses = @("explorer", "SearchHost", "brave")
-    foreach ($app in $monitoredApps) {
-        $excludeProcesses += ($app -replace " \.exe$", "" -replace "Google ", "" -replace "Microsoft ", "").ToLower()
-    }
-
-    foreach ($window in (Get-AllWindowInfo)) {
-        if ($excludeProcesses -contains $window.ProcessName.ToLower()) { continue }
-        if (Test-IsFullscreenOrBorderless $window) {
-            return @{ IsFullscreen = $true; Details = "$($window.ProcessName) - $($window.Title)" }
-        }
-    }
-    return @{ IsFullscreen = $false; Details = "" }
-}
-
 function Update-HomeAssistantState {
     param($state, $details)
     $headers = @{ "Authorization" = "Bearer $haToken"; "Content-Type" = "application/json" }
@@ -221,8 +134,7 @@ Write-Host "========================================"
 Write-Host "Desktop Media Monitor"
 Write-Host "========================================"
 Write-Host "Brave detection : SMTC (SourceAppUserModelId = 'Brave')"
-Write-Host "Other apps      : SoundVolumeView"
-Write-Host "Fullscreen      : $(if ($monitorFullscreen) { 'Enabled' } else { 'Disabled' })"
+Write-Host "Other apps      : SoundVolumeView ($($monitoredApps -join ', '))"
 Write-Host "Check interval  : $checkInterval seconds"
 Write-Host "SVV             : $(if (Test-Path $soundVolumeViewPath) { 'Found' } else { 'NOT FOUND' })"
 Write-Host ""
@@ -246,14 +158,6 @@ try {
             if ($audioCheck.IsPlaying) {
                 $mediaActive = $true
                 $details     = $audioCheck.Details
-            }
-        }
-
-        if (-not $mediaActive) {
-            $fsCheck = Test-AnyFullscreenWindow
-            if ($fsCheck.IsFullscreen) {
-                $mediaActive = $true
-                $details     = $fsCheck.Details
             }
         }
 
