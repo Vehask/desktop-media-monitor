@@ -22,12 +22,44 @@ $monitoredApps = @(
     "Discord"
 )
 
-$monitorBrave = $true
+$monitorBrave      = $true
+$monitorFullscreen = $true
 
 # ============================================================================
 
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 [void][Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media.Control, ContentType=WindowsRuntime]
+
+# P/Invoke for foreground window checks (no EnumWindows — only the active window)
+if (-not ([System.Management.Automation.PSTypeName]'ForegroundWindowHelper').Type) {
+    Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public class ForegroundWindowHelper {
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")]
+    public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+}
+"@
+}
 
 function Invoke-Async($op, $type) {
     $asTaskMethod = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
@@ -99,6 +131,61 @@ function Test-MonitoredAppsPlayingAudio {
     return @{ IsPlaying = $false; Details = "" }
 }
 
+function Test-ForegroundFullscreen {
+    if (-not $monitorFullscreen) { return @{ IsFullscreen = $false; Details = "" } }
+
+    try {
+        $hwnd = [ForegroundWindowHelper]::GetForegroundWindow()
+        if ($hwnd -eq [IntPtr]::Zero) { return @{ IsFullscreen = $false; Details = "" } }
+
+        # Skip if the window isn't visible (hidden/ghost window)
+        if (-not [ForegroundWindowHelper]::IsWindowVisible($hwnd)) {
+            return @{ IsFullscreen = $false; Details = "" }
+        }
+
+        # Get window title
+        $title = New-Object System.Text.StringBuilder 256
+        [ForegroundWindowHelper]::GetWindowText($hwnd, $title, $title.Capacity) | Out-Null
+        $windowTitle = $title.ToString()
+
+        # Skip windows with no title (desktop, system panels, etc.)
+        if ($windowTitle.Length -eq 0) { return @{ IsFullscreen = $false; Details = "" } }
+
+        # Get process name for exclusion check
+        $processId = 0
+        [ForegroundWindowHelper]::GetWindowThreadProcessId($hwnd, [ref]$processId) | Out-Null
+        $processName = ""
+        try { $processName = (Get-Process -Id $processId -ErrorAction SilentlyContinue).ProcessName.ToLower() } catch {}
+
+        # Exclude known non-game processes
+        $excluded = @("explorer", "SearchHost", "ApplicationFrameHost", "LockApp")
+        foreach ($app in $monitoredApps) {
+            $excluded += ($app -replace " \.exe$", "" -replace "Google ", "" -replace "Microsoft ", "").ToLower()
+        }
+        # Also exclude brave via SMTC (already detected via Test-BravePlayingViaSMTC)
+        $excluded += @("brave")
+
+        if ($excluded -contains $processName) { return @{ IsFullscreen = $false; Details = "" } }
+
+        # Get window bounds and check against screen resolution
+        $rect = New-Object ForegroundWindowHelper+RECT
+        [ForegroundWindowHelper]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
+
+        Add-Type -AssemblyName System.Windows.Forms
+        foreach ($screen in [System.Windows.Forms.Screen]::AllScreens) {
+            $b = $screen.Bounds
+            if ($rect.Left -le $b.Left -and $rect.Top -le $b.Top -and
+                $rect.Right -ge ($b.Left + $b.Width) -and $rect.Bottom -ge ($b.Top + $b.Height)) {
+                return @{ IsFullscreen = $true; Details = "$processName - $windowTitle" }
+            }
+        }
+    } catch {
+        Write-Host "Foreground fullscreen check failed: $_"
+    }
+
+    return @{ IsFullscreen = $false; Details = "" }
+}
+
 function Update-HomeAssistantState {
     param($state, $details)
     $headers = @{ "Authorization" = "Bearer $haToken"; "Content-Type" = "application/json" }
@@ -133,10 +220,11 @@ function Update-HomeAssistantState {
 Write-Host "========================================"
 Write-Host "Desktop Media Monitor"
 Write-Host "========================================"
-Write-Host "Brave detection : SMTC (SourceAppUserModelId = 'Brave')"
-Write-Host "Other apps      : SoundVolumeView ($($monitoredApps -join ', '))"
-Write-Host "Check interval  : $checkInterval seconds"
-Write-Host "SVV             : $(if (Test-Path $soundVolumeViewPath) { 'Found' } else { 'NOT FOUND' })"
+Write-Host "Brave detection    : SMTC (SourceAppUserModelId = 'Brave')"
+Write-Host "Other apps         : SoundVolumeView ($($monitoredApps -join ', '))"
+Write-Host "Fullscreen         : $(if ($monitorFullscreen) { 'Enabled (foreground only)' } else { 'Disabled' })'"
+Write-Host "Check interval     : $checkInterval seconds"
+Write-Host "SVV                : $(if (Test-Path $soundVolumeViewPath) { 'Found' } else { 'NOT FOUND' })"
 Write-Host ""
 
 $lastState   = ""
@@ -147,17 +235,31 @@ try {
         $mediaActive = $false
         $details     = ""
 
+        # Check 1: Brave audio via SMTC
         $braveCheck = Test-BravePlayingViaSMTC
         if ($braveCheck.IsPlaying) {
             $mediaActive = $true
             $details     = $braveCheck.Details
         }
 
+        # Check 2: Chrome / Discord audio via SoundVolumeView
         if (-not $mediaActive) {
             $audioCheck = Test-MonitoredAppsPlayingAudio
             if ($audioCheck.IsPlaying) {
                 $mediaActive = $true
                 $details     = $audioCheck.Details
+            }
+        }
+
+        # Check 3: Foreground window is fullscreen (games, apps)
+        # Only checks the active foreground window — NOT all open windows.
+        # This prevents false "on" states from background/maximized windows
+        # sitting around when the machine is idle.
+        if (-not $mediaActive) {
+            $fsCheck = Test-ForegroundFullscreen
+            if ($fsCheck.IsFullscreen) {
+                $mediaActive = $true
+                $details     = $fsCheck.Details
             }
         }
 

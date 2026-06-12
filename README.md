@@ -1,6 +1,6 @@
 # Desktop Media Monitor
 
-Report Windows desktop media playback state (browser audio and Discord voice sessions) to Home Assistant as a `binary_sensor`.
+Report Windows desktop media playback state (browser audio, Discord voice, and fullscreen apps) to Home Assistant as a `binary_sensor`.
 
 ## Architecture
 
@@ -11,21 +11,23 @@ Report Windows desktop media playback state (browser audio and Discord voice ses
 │  desktop-media-monitor-launcher.vbs (auto-restart)  │
 │         │                                           │
 │         ▼ (spawns & watches)                        │
-│  desktop-media-monitor.ps1 (main loop, polls 5s)      │
+│  desktop-media-monitor.ps1 (main loop, polls 5s)    │
 │         │                                           │
 │         ├── SMTC API → Brave (YouTube, Spotify)     │
-│         └── SoundVolumeView → Chrome, Discord       │
+│         ├── SoundVolumeView → Chrome, Discord       │
+│         └── GetForegroundWindow → games, fullscreen │
 │         │                                           │
 │         ▼ (POST /api/states/)                       │
 │  Home Assistant ── binary_sensor.desktop_media_active│
 └─────────────────────────────────────────────────────┘
 ```
 
-Detection sources:
+Detection sources (checked in order):
 1. **SMTC (System Media Transport Controls)** — detects Brave browser media playback (YouTube Music, Spotify Web, etc.) via Windows Runtime API
 2. **SoundVolumeView.exe** (NirSoft) — detects active audio sessions from Chrome and Discord voice calls
+3. **Foreground fullscreen detection** — detects fullscreen/borderless apps (games, tools) using only the **active foreground window** (`GetForegroundWindow`), not `EnumWindows` (background windows are ignored)
 
-> **Note:** Fullscreen/borderless window detection was intentionally removed. The sensor only triggers on actual audio playback — not on which windows are open or maximized. This prevents false "on" states when the machine is idle but has open windows.
+> **Why foreground-only?** The original version used `EnumWindows` which checks ALL open windows. A maximized window sitting in the background could trigger a false "on" state for days. By checking only `GetForegroundWindow`, the sensor only fires when the user is actively looking at a fullscreen app. When you alt-tab or close the game, the foreground changes and the sensor goes "off" automatically.
 
 ## Files
 
@@ -44,7 +46,7 @@ Detection sources:
 - **Home Assistant** instance with a **Long-Lived Access Token**
 - **SoundVolumeView** (required for Chrome/Discord detection) — [Download from NirSoft](https://www.nirsoft.net/utils/sound_volume_view.html)
 
-> SoundVolumeView is **required** if you want to detect Chrome audio or Discord voice sessions. Brave detection works via SMTC (built-in Windows API) without additional tools.
+> SoundVolumeView is **required** if you want to detect Chrome audio or Discord voice sessions. Brave detection works via SMTC (built-in Windows API) without additional tools. Fullscreen detection works natively without any extra software.
 
 ## Setup
 
@@ -99,13 +101,21 @@ binary_sensor.desktop_media_active:
   attributes:
     friendly_name: "Desktop Media Active"
     device_class: "running"
-    details: "Brave: Song Title" | "Discord audio active" | "Google Chrome audio active: window title"
+    details: "Brave: Song Title" | "Discord audio active" | "Google Chrome audio active" | "game.exe - Window Title"
     monitored_apps: "Google Chrome, Discord, Brave (SMTC)"
 ```
 
-**What triggers "on":** Brave browser playing audio (YouTube, Spotify Web), Chrome playing audio (any tab), Discord in a voice call.
+**What triggers "on":**
+- Brave playing audio (YouTube, Spotify Web) via SMTC
+- Chrome playing audio (any tab) via SoundVolumeView
+- Discord in a voice call via SoundVolumeView
+- Any app/game running fullscreen or borderless in the **foreground** (active window)
 
-**What stays "off":** Maximized/borderless windows, games running, idle system, monitors sleeping.
+**What stays "off:
+- Background maximized windows (no EnumWindows — only foreground checked)
+- Idle system with monitors sleeping
+- Browser tabs with no audio playing
+- Desktop / lock screen / system panels
 
 ### 7. Stop the monitor
 
@@ -149,6 +159,7 @@ Optionally add a shortcut to the launcher in your Startup folder (`shell:startup
 | `$soundVolumeViewPath` | `Join-Path $PSScriptRoot "Tools\SoundVolumeView.exe"` | Path to SoundVolumeView.exe |
 | `$monitoredApps` | `@("Google Chrome", "Discord")` | Apps checked via SoundVolumeView |
 | `$monitorBrave` | `$true` | Enable/disable Brave SMTC detection |
+| `$monitorFullscreen` | `$true` | Enable/disable foreground fullscreen detection |
 
 ## Troubleshooting
 
@@ -157,6 +168,7 @@ Optionally add a shortcut to the launcher in your Startup folder (`shell:startup
 | No state updates in HA | Verify `$haUrl` and `$haToken` are correct |
 | "SoundVolumeView not found" | Download SVV.exe and place in `Tools\` subfolder |
 | No Brave detection | Play something in Brave that shows media controls (YouTube, Spotify Web) |
+| Game not detected as fullscreen | Some games run in windowed mode — check game display settings |
+| False "on" from fullscreen | Only checked on the foreground window. If still false, add exclusions in `$monitoredApps` |
 | Monitor keeps crashing | Run directly (not via launcher) to see error output |
 | SMTC not working | Run `diag.ps1` to verify the API is accessible |
-| Sensor stuck "on" for no reason | This was a known issue with the old fullscreen detection — removed in v2. If still happening, check SoundVolumeView for stale audio sessions |
