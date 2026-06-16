@@ -1,99 +1,98 @@
 # Desktop Media Monitor
 
-Report Windows desktop media playback state (browser audio, Discord voice, and fullscreen apps) to Home Assistant as a `binary_sensor`.
+Report Windows desktop media playback state (YouTube, Spotify, Brave, Chrome, Discord, fullscreen apps) to Home Assistant as a `binary_sensor`.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  Windows Desktop                                    │
-│                                                     │
-│  desktop-media-monitor-launcher.vbs (auto-restart)  │
-│         │                                           │
-│         ▼ (spawns & watches)                        │
-│  desktop-media-monitor.ps1 (main loop, polls 5s)    │
-│         │                                           │
-│         ├── SMTC API → Brave (YouTube, Spotify)     │
-│         ├── SoundVolumeView → Chrome, Discord       │
-│         └── GetForegroundWindow → games, fullscreen │
-│         │                                           │
-│         ▼ (POST /api/states/)                       │
-│  Home Assistant ── binary_sensor.desktop_media_active│
-└─────────────────────────────────────────────────────┘
+Scheduled Task (AtStartup, SYSTEM)
+         |
+         v
+VBS Launcher (auto-restart every 10s on crash)
+         |
+         v
+desktop-media-monitor.ps1 (main loop, polls every 5s)
+         |
+         +-- SMTC API -> Brave/YouTube/Spotify playback
+         +-- SoundVolumeView -> Chrome, Discord audio
+         +-- Win32 GetForegroundWindow -> fullscreen/borderless apps
+         |
+         v (POST /api/states/)
+    Home Assistant -> binary_sensor.desktop_media_active
 ```
 
-Detection sources (checked in order):
-1. **SMTC (System Media Transport Controls)** — detects Brave browser media playback (YouTube Music, Spotify Web, etc.) via Windows Runtime API
-2. **SoundVolumeView.exe** (NirSoft) — detects active audio sessions from Chrome and Discord voice calls
-3. **Foreground fullscreen detection** — detects fullscreen/borderless apps (games, tools) using only the **active foreground window** (`GetForegroundWindow`), not `EnumWindows` (background windows are ignored)
-
-> **Why foreground-only?** The original version used `EnumWindows` which checks ALL open windows. A maximized window sitting in the background could trigger a false "on" state for days. By checking only `GetForegroundWindow`, the sensor only fires when the user is actively looking at a fullscreen app. When you alt-tab or close the game, the foreground changes and the sensor goes "off" automatically.
+Detection sources:
+1. **SMTC (System Media Transport Controls)** — Brave browser media (YouTube Music, Spotify Web)
+2. **SoundVolumeView.exe** (NirSoft) — Chrome, Discord audio sessions
+3. **Foreground fullscreen detection** — borderless/fullscreen apps (excludes Brave, Explorer, SearchHost, monitored apps)
 
 ## Files
 
 | File | Purpose |
 |------|---------|
 | `desktop-media-monitor.ps1` | **Main monitor** — polls every 5s, reports state to HA |
-| `desktop-media-monitor-launcher.vbs` | **Auto-restart wrapper** — restarts the script if it crashes |
-| `windows-media-session-api.ps1` | **Lighter alternative** — only uses SMTC, simpler active/inactive state |
-| `diag.ps1` | Diagnostic tool — dumps all active SMTC sessions |
-| `stop-media-monitor.ps1` | Stops the running monitor by killing its PowerShell process |
-| `stop-media-monitor-launcher.vbs` | VBS launcher for the stop script |
+| `desktop-media-monitor-launcher.vbs` | **Auto-restart wrapper** — restarts PS1 if it crashes |
+
+## What's New in v3
+
+- **Single-instance lock** — PID file in `%TEMP%` prevents duplicate processes
+- **SMTC lazy reinit** — SMTC manager auto-reinitializes on failure (no stuck sessions)
+- **5-minute heartbeat** — periodic state push prevents stale HA state
+- **Organized folder** — scripts live in their own subdirectory
+- **Debug scripts removed** — `diag.ps1`, `SoundVolumeViewDebug.ps1`, `windows-media-session-api.ps1`, `stop-media-monitor.ps1` and `.vbs` are no longer needed
 
 ## Prerequisites
 
 - **PowerShell** (built into Windows 10/11)
-- **Home Assistant** instance with a **Long-Lived Access Token**
-- **SoundVolumeView** (required for Chrome/Discord detection) — [Download from NirSoft](https://www.nirsoft.net/utils/sound_volume_view.html)
-
-> SoundVolumeView is **required** if you want to detect Chrome audio or Discord voice sessions. Brave detection works via SMTC (built-in Windows API) without additional tools. Fullscreen detection works natively without any extra software.
+- **Home Assistant** instance with a Long-Lived Access Token
+- **SoundVolumeView** (optional, for Chrome/Discord audio) — [Download from NirSoft](https://www.nirsoft.net/utils/sound_volume_view.html)
 
 ## Setup
 
 ### 1. Clone or copy scripts
 
-Place all `.ps1` and `.vbs` files in a folder on your Windows desktop, e.g.:
+Place in a folder on your Windows desktop:
 
 ```
 C:\Scripts\desktop-media-monitor\
+  desktop-media-monitor.ps1
+  desktop-media-monitor-launcher.vbs
 ```
 
-### 2. Download SoundVolumeView
-
-Download `SoundVolumeView.exe` from NirSoft and place it in a `Tools\` subfolder:
+### 2. Download SoundVolumeView (optional)
 
 ```
-C:\Scripts\desktop-media-monitor\Tools\SoundVolumeView.exe
+C:\Scripts\Tools\SoundVolumeView.exe
 ```
 
-### 3. Configure the monitor
+### 3. Configure
 
 Edit `desktop-media-monitor.ps1` and set:
 
 ```powershell
-$haUrl   = "http://YOUR_HA_IP:8123"              # Your Home Assistant URL
-$haToken = "YOUR_HA_LONG_LIVED_TOKEN"             # HA Long-Lived Access Token
+$haUrl   = "http://YOUR_HA_IP:8123"
+$haToken = "YOUR_HA_LONG_LIVED_TOKEN"
 ```
 
-Generate the token in Home Assistant: **Profile → Security → Long-Lived Access Tokens**.
+### 4. Install as scheduled task
 
-### 4. Test it
-
-Run `diag.ps1` first to verify SMTC is working — play something in Brave/YouTube and confirm sessions appear.
-
-### 5. Run the monitor (two options)
-
-**Option A — Persistent with auto-restart** (recommended):
-Double-click `desktop-media-monitor-launcher.vbs`. It runs the PowerShell script and automatically restarts it if it crashes.
-
-**Option B — Direct PowerShell**:
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File "C:\path\to\desktop-media-monitor.ps1"
+$action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument '//B "C:\Scripts\desktop-media-monitor\desktop-media-monitor-launcher.vbs"'
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 72)
+$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+Register-ScheduledTask -TaskName 'DesktopMediaMonitor_Start' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force
 ```
 
-### 6. Home Assistant entity
+### 5. Run it
 
-The monitor creates/updates:
+```powershell
+schtasks /run /tn DesktopMediaMonitor_Start
+```
+
+Or reboot the machine.
+
+## Home Assistant entity
 
 ```yaml
 binary_sensor.desktop_media_active:
@@ -101,74 +100,48 @@ binary_sensor.desktop_media_active:
   attributes:
     friendly_name: "Desktop Media Active"
     device_class: "running"
-    details: "Brave: Song Title" | "Discord audio active" | "Google Chrome audio active" | "game.exe - Window Title"
+    details: "Brave: Song Title" | "Chrome audio active" | "Game.exe - Window Title"
     monitored_apps: "Google Chrome, Discord, Brave (SMTC)"
 ```
 
-**What triggers "on":**
-- Brave playing audio (YouTube, Spotify Web) via SMTC
-- Chrome playing audio (any tab) via SoundVolumeView
-- Discord in a voice call via SoundVolumeView
-- Any app/game running fullscreen or borderless in the **foreground** (active window)
+## Auto-restart mechanics
 
-**What stays "off:
-- Background maximized windows (no EnumWindows — only foreground checked)
-- Idle system with monitors sleeping
-- Browser tabs with no audio playing
-- Desktop / lock screen / system panels
-
-### 7. Stop the monitor
-
-Double-click `stop-media-monitor-launcher.vbs` or run:
-
-```powershell
-.\stop-media-monitor.ps1
-```
-
-## How the auto-restart launcher works
-
-`desktop-media-monitor-launcher.vbs` uses a `Do While True` loop:
-
-1. Spawns `powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File "desktop-media-monitor.ps1"`
-2. Waits for the process to exit (third argument `True` means synchronous)
+The VBS launcher uses a `Do While True` loop:
+1. Spawns `powershell.exe -WindowStyle Hidden ... desktop-media-monitor.ps1`
+2. Waits for exit (third arg `True` = synchronous)
 3. On exit (crash or normal), waits 10 seconds
-4. Restarts the PowerShell script
+4. Restarts
 
-This means even if the PowerShell script crashes due to transient errors, it comes back automatically.
+## Single-instance lock
 
-## Auto-start on boot (recommended)
+On startup, the PS1 script writes its PID to `%TEMP%\desktop-media-monitor.lock`. If the file exists and points to a live process, the new instance exits immediately. This prevents duplicate processes that can cause duplicate HA state updates.
 
-Create a scheduled task so the monitor starts at boot:
+## Stability improvements in v3
 
-```cmd
-schtasks /create /tn "DesktopMediaMonitor_Start" /tr "wscript.exe //B C:\path\to\desktop-media-monitor-launcher.vbs" /sc onstart /ru SYSTEM /it /rl highest /delay 0000:15
-```
-
-This starts the monitor 15 seconds after Windows boots, even before you log in.
-
-Optionally add a shortcut to the launcher in your Startup folder (`shell:startup`) if you prefer a per-user start.
+| Issue | Fix |
+|-------|-----|
+| Two PS1 instances running | PID lock file prevents duplicates |
+| SMTC crashes after hours | Lazy reinit — resets the manager on failure |
+| HA shows stale state | 5-minute heartbeat pushes current state |
+| Script crashes silently | VBS launcher restarts in 10s |
+| Token truncated in file | Full token verified at 183 chars on deploy |
 
 ## Customization
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `$haUrl` | `"http://YOUR_HA_IP:8123"` | Home Assistant instance URL |
-| `$haToken` | `"YOUR_HA_LONG_LIVED_TOKEN"` | HA Long-Lived Access Token |
-| `$entityId` | `"binary_sensor.desktop_media_active"` | Entity ID to report state to |
-| `$checkInterval` | `5` | Polling interval in seconds |
-| `$soundVolumeViewPath` | `Join-Path $PSScriptRoot "Tools\SoundVolumeView.exe"` | Path to SoundVolumeView.exe |
-| `$monitoredApps` | `@("Google Chrome", "Discord")` | Apps checked via SoundVolumeView |
-| `$monitorBrave` | `$true` | Enable/disable Brave SMTC detection |
-| `$monitorFullscreen` | `$true` | Enable/disable foreground fullscreen detection |
+- **Monitored apps** — Edit `$monitoredApps` array
+- **Fullscreen monitoring** — Set `$monitorFullscreen = $false`
+- **Check interval** — Change `$checkInterval` (default: 5s)
+- **Brave detection** — Set `$monitorBrave = $false`
+- **Entity ID** — Change `$entityId`
 
 ## Troubleshooting
 
 | Symptom | Check |
 |---------|-------|
-| No state updates in HA | Verify `$haUrl` and `$haToken` are correct |
-| "SoundVolumeView not found" | Download SVV.exe and place in `Tools\` subfolder |
-| No Brave detection | Play something in Brave that shows media controls (YouTube, Spotify Web) |
-| Game not detected as fullscreen | Some games run in windowed mode — check game display settings |
-| False "on" from fullscreen | Only checked on the foreground window. If still false, add exclusions in `$monitoredApps` |
+| No state updates in HA | Verify `$haUrl` and `$haToken` are correct (token should be ~183 chars) |
+| "SoundVolumeView not found" | Download SVV.exe and place in `Tools\` folder |
+| No Brave detection | Play something in Brave with media controls (YouTube, Spotify Web) |
 | Monitor keeps crashing | Run directly (not via launcher) to see error output |
-| SMTC not working | Run `diag.ps1` to verify the API is accessible |
+| Duplicate PIDs found | Lock file at `%TEMP%\desktop-media-monitor.lock` prevents this |
+| HA shows stale "on" state | Script heartbeat pushes state every 5 minutes |
+| SMTC errors when SYSTEM runs the script | This is expected — SMTC needs a user session. Brave detection degrades gracefully |

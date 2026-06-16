@@ -1,20 +1,15 @@
 # ============================================================================
-# CONFIGURATION — Customize these before running
+# CONFIGURATION
 # ============================================================================
 
-# Your Home Assistant instance URL
 $haUrl         = "http://YOUR_HA_IP:8123"
-
-# Create a Long-Lived Access Token in HA: Profile > Security > Long-Lived Access Tokens
 $haToken       = "YOUR_HA_LONG_LIVED_TOKEN"
-
-# The entity ID to report state to (customize this if needed)
 $entityId      = "binary_sensor.desktop_media_active"
 
 $checkInterval = 5
 
-# Path to NirSoft SoundVolumeView.exe (download from https://www.nirsoft.net/utils/sound_volume_view.html)
-$soundVolumeViewPath = Join-Path $PSScriptRoot "Tools\SoundVolumeView.exe"
+# SoundVolumeView lives in the shared Tools directory (sibling to this folder)
+$soundVolumeViewPath = "C:\Scripts\Tools\SoundVolumeView.exe"
 
 # Apps monitored via SoundVolumeView (Brave is handled separately via SMTC)
 $monitoredApps = @(
@@ -27,10 +22,38 @@ $monitorFullscreen = $true
 
 # ============================================================================
 
+# Single-instance lock — exit immediately if another instance is already running
+$scriptLock = Join-Path $env:TEMP "desktop-media-monitor.lock"
+try {
+    if (Test-Path $scriptLock -PathType Leaf) {
+        $oldPid = Get-Content $scriptLock -TotalCount 1 -ErrorAction SilentlyContinue
+        if ($oldPid -match '^\d+$') {
+            $oldPidNum = [int]$oldPid
+            if ($oldPidNum -ne [System.Diagnostics.Process]::GetCurrentProcess().Id) {
+                $oldProcess = Get-Process -Id $oldPidNum -ErrorAction SilentlyContinue
+                if ($oldProcess) {
+                    Write-Host "Another instance (PID $oldPidNum) is already running. Exiting."
+                    exit 0
+                }
+            }
+        }
+    }
+    [System.IO.File]::WriteAllText($scriptLock, [System.Diagnostics.Process]::GetCurrentProcess().Id.ToString())
+} catch {
+    Write-Host "Could not create lock file (non-fatal): $_"
+}
+
+# Clean up lock file on exit
+Register-EngineEvent -SourceIdentifier PowerShell.Exiting -SupportEvent -Action {
+    try { Remove-Item $scriptLock -ErrorAction SilentlyContinue } catch {}
+} | Out-Null
+
+# ============================================================================
+
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 [void][Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media.Control, ContentType=WindowsRuntime]
 
-# P/Invoke for foreground window checks (no EnumWindows — only the active window)
+# P/Invoke for foreground window checks (only the active window, NOT EnumWindows)
 if (-not ([System.Management.Automation.PSTypeName]'ForegroundWindowHelper').Type) {
     Add-Type @"
 using System;
@@ -68,20 +91,39 @@ function Invoke-Async($op, $type) {
         $_.GetParameters().Count -eq 1 -and
         $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
     } | Select-Object -First 1
+    if (-not $asTaskMethod) { throw "Cannot find AsTask method for IAsyncOperation<$type>" }
     $task = $asTaskMethod.MakeGenericMethod($type).Invoke($null, @($op))
     $task.Wait()
     return $task.Result
 }
 
-$smtcManager = Invoke-Async `
-    ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync()) `
-    ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager])
+# SMTC manager — auto-reinitializes on failure
+$script:SmtcManager = $null
+function Get-SmtcManager {
+    if (-not $script:SmtcManager) {
+        try {
+            $script:SmtcManager = Invoke-Async `
+                ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync()) `
+                ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager])
+        } catch {
+            Write-Host "SMTC Manager init failed: $_"
+            return $null
+        }
+    }
+    return $script:SmtcManager
+}
+
+# Initialize SMTC manager at startup
+$null = Get-SmtcManager
 
 function Test-BravePlayingViaSMTC {
     if (-not $monitorBrave) { return @{ IsPlaying = $false; Details = "" } }
 
     try {
-        $sessions = $smtcManager.GetSessions()
+        $manager = Get-SmtcManager
+        if (-not $manager) { return @{ IsPlaying = $false; Details = "" } }
+
+        $sessions = $manager.GetSessions()
         foreach ($session in $sessions) {
             if ($session.SourceAppUserModelId -eq "Brave") {
                 $status = $session.GetPlaybackInfo().PlaybackStatus
@@ -97,6 +139,7 @@ function Test-BravePlayingViaSMTC {
         }
     } catch {
         Write-Host "SMTC check failed: $_"
+        $script:SmtcManager = $null  # Force re-init next time
     }
 
     return @{ IsPlaying = $false; Details = "" }
@@ -112,8 +155,13 @@ function Test-MonitoredAppsPlayingAudio {
         $tempFile = [System.IO.Path]::GetTempFileName()
         & $soundVolumeViewPath /scomma $tempFile | Out-Null
         Start-Sleep -Milliseconds 500
+
+        if (-not (Test-Path $tempFile)) { return @{ IsPlaying = $false; Details = "" } }
+
         $audioData = Import-Csv $tempFile -ErrorAction SilentlyContinue
         Remove-Item $tempFile -ErrorAction SilentlyContinue
+
+        if (-not $audioData) { return @{ IsPlaying = $false; Details = "" } }
 
         foreach ($session in $audioData) {
             if ($monitoredApps -contains $session.Name -and $session.'Device State' -eq "Active") {
@@ -138,36 +186,29 @@ function Test-ForegroundFullscreen {
         $hwnd = [ForegroundWindowHelper]::GetForegroundWindow()
         if ($hwnd -eq [IntPtr]::Zero) { return @{ IsFullscreen = $false; Details = "" } }
 
-        # Skip if the window isn't visible (hidden/ghost window)
         if (-not [ForegroundWindowHelper]::IsWindowVisible($hwnd)) {
             return @{ IsFullscreen = $false; Details = "" }
         }
 
-        # Get window title
         $title = New-Object System.Text.StringBuilder 256
         [ForegroundWindowHelper]::GetWindowText($hwnd, $title, $title.Capacity) | Out-Null
         $windowTitle = $title.ToString()
 
-        # Skip windows with no title (desktop, system panels, etc.)
         if ($windowTitle.Length -eq 0) { return @{ IsFullscreen = $false; Details = "" } }
 
-        # Get process name for exclusion check
         $processId = 0
         [ForegroundWindowHelper]::GetWindowThreadProcessId($hwnd, [ref]$processId) | Out-Null
         $processName = ""
         try { $processName = (Get-Process -Id $processId -ErrorAction SilentlyContinue).ProcessName.ToLower() } catch {}
 
-        # Exclude known non-game processes
         $excluded = @("explorer", "SearchHost", "ApplicationFrameHost", "LockApp")
         foreach ($app in $monitoredApps) {
             $excluded += ($app -replace " \.exe$", "" -replace "Google ", "" -replace "Microsoft ", "").ToLower()
         }
-        # Also exclude brave via SMTC (already detected via Test-BravePlayingViaSMTC)
         $excluded += @("brave")
 
         if ($excluded -contains $processName) { return @{ IsFullscreen = $false; Details = "" } }
 
-        # Get window bounds and check against screen resolution
         $rect = New-Object ForegroundWindowHelper+RECT
         [ForegroundWindowHelper]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
 
@@ -207,10 +248,9 @@ function Update-HomeAssistantState {
             return $true
         } catch {
             if ($attempt -lt $maxRetries) {
-                Write-Host "HA update attempt $attempt/$maxRetries failed, retrying in ${retryDelay}s: $_"
                 Start-Sleep -Seconds $retryDelay
             } else {
-                Write-Host "Failed to update Home Assistant after $maxRetries attempts: $_"
+                Write-Host "HA update failed after $maxRetries attempts: $_"
             }
         }
     }
@@ -218,17 +258,19 @@ function Update-HomeAssistantState {
 }
 
 Write-Host "========================================"
-Write-Host "Desktop Media Monitor"
+Write-Host "Desktop Media Monitor v3"
 Write-Host "========================================"
 Write-Host "Brave detection    : SMTC (SourceAppUserModelId = 'Brave')"
 Write-Host "Other apps         : SoundVolumeView ($($monitoredApps -join ', '))"
-Write-Host "Fullscreen         : $(if ($monitorFullscreen) { 'Enabled (foreground only)' } else { 'Disabled' })'"
+Write-Host "Fullscreen         : $(if ($monitorFullscreen) { 'Enabled (foreground only)' } else { 'Disabled' })"
 Write-Host "Check interval     : $checkInterval seconds"
 Write-Host "SVV                : $(if (Test-Path $soundVolumeViewPath) { 'Found' } else { 'NOT FOUND' })"
+Write-Host "Lock file          : $scriptLock"
 Write-Host ""
 
 $lastState   = ""
 $lastDetails = ""
+$lastHeartbeat = [DateTime]::UtcNow
 
 try {
     while ($true) {
@@ -251,10 +293,9 @@ try {
             }
         }
 
-        # Check 3: Foreground window is fullscreen (games, apps)
-        # Only checks the active foreground window — NOT all open windows.
-        # This prevents false "on" states from background/maximized windows
-        # sitting around when the machine is idle.
+        # Check 3: Foreground fullscreen window (games, apps)
+        # Only inspects the single active window — NOT all open windows.
+        # This prevents false "on" from background maximized windows sitting idle.
         if (-not $mediaActive) {
             $fsCheck = Test-ForegroundFullscreen
             if ($fsCheck.IsFullscreen) {
@@ -264,20 +305,29 @@ try {
         }
 
         $currentState = if ($mediaActive) { "on" } else { "off" }
-        if ($currentState -ne $lastState -or $details -ne $lastDetails) {
+
+        # Send heartbeat every 5 minutes to prevent stale state in HA
+        $heartbeatDue = ([DateTime]::UtcNow - $lastHeartbeat).TotalMinutes -ge 5
+        $stateChanged = ($currentState -ne $lastState -or $details -ne $lastDetails)
+
+        if ($stateChanged -or $heartbeatDue) {
             if (Update-HomeAssistantState $currentState $details) {
-                Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $currentState $(if ($details) { "- $details" })"
+                if ($stateChanged) {
+                    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $currentState $(if ($details) { "- $details" })"
+                }
                 $lastState   = $currentState
                 $lastDetails = $details
+                $lastHeartbeat = [DateTime]::UtcNow
             }
         }
 
         Start-Sleep -Seconds $checkInterval
     }
 } catch {
-    Write-Host "[FATAL] Unhandled exception in main loop, exiting: $_"
+    Write-Host "[FATAL] Unhandled exception, exiting: $_"
     Write-Host "Stack: $($_.ScriptStackTrace)"
     Start-Sleep -Seconds 5
 } finally {
     Write-Host "Monitor stopped (will restart via launcher)"
+    try { Remove-Item $scriptLock -ErrorAction SilentlyContinue } catch {}
 }
